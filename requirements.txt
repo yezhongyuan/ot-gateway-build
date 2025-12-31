@@ -1,0 +1,5 @@
+asyncua==1.0.6
+aiomysql==0.2.0
+loguru==0.7.2
+cryptography==41.0.0
+pyinstaller==6.0.0
