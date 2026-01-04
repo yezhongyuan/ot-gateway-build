@@ -1,0 +1,9 @@
+{
+   "Device_A": {
+     "trigger": "ns=2;s=BMW_WEIBEN_OP100.OP100.in_fp_barcode",
+     "items": [
+       "ns=2;s=BMW_WEIBEN_OP100.OP100.prod_code",
+       "ns=2;s=BMW_HS_OP20.OP20_HS.p_cs03"
+     ]
+   }
+}

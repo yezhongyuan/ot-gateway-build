@@ -1,0 +1,37 @@
+name: 自动打包工业网关EXE
+
+on:
+  push:
+    branches: [ main ]  # 只要你提交代码到 main 分支，就开始打包
+  workflow_dispatch:     # 允许你手动点击按钮触发
+
+jobs:
+  build_windows:
+    runs-on: windows-latest  # 告诉 GitHub 启动一台 Windows 虚拟机
+
+    steps:
+    - name: 1. 拉取代码
+      uses: actions/checkout@v4
+
+    - name: 2. 安装 Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 3. 安装必要的工业库
+      run: |
+        python -m pip install --upgrade pip
+        pip install asyncua aiomysql loguru cryptography pyinstaller
+
+    - name: 4. 执行 PyInstaller 打包
+      # --collect-all asyncua 是解决 OPC UA 报错的关键
+      run: |
+        pyinstaller -F --collect-all asyncua --add-data "nodes_config.json;." -n IOT_Gateway_Windows OpcUa_Service.py
+
+    - name: 5. 将生成的 EXE 存为产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: Gateway_Exe_Build_Result  # 这是下载时的文件夹名
+        path: |
+          dist/IOT_Gateway_Windows.exe
+          nodes_config.json

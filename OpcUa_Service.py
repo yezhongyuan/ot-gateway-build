@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import sys
 import time
@@ -6,6 +7,8 @@ import signal
 import os
 from logging.handlers import RotatingFileHandler
 from typing import List, Any
+import uuid
+import json
 
 # 第三方库: pip install asyncua aiomysql loguru
 import aiomysql
@@ -13,23 +16,31 @@ from asyncua import Client, ua
 from asyncua.common.node import Node
 from loguru import logger
 
+# 导入我们新创建的归档器类
+from file_archiver import DailyFileArchiver
+
 # ================= 配置区域 (建议生产环境放入 .env 文件) =================
 
 # OPC UA 服务端地址
-OPC_URL = "opc.tcp://localhost:4840"
-
-# 需要订阅采集的点位列表 (NodeID)
-TARGET_NODES = [
-    "ns=2;i=2",  # 温度
-]
+OPC_URL = "opc.tcp://172.21.254.50:49320"
 
 # 数据库连接配置
+# DB_CONFIG = {
+#     'host': '127.0.0.1',
+#     'port': 3306,
+#     'user': 'root',
+#     'password': '123456',  # 请修改密码
+#     'db': 'test01',
+#     'autocommit': True,
+#     'connect_timeout': 10
+# }
+
 DB_CONFIG = {
-    'host': '127.0.0.1',
+    'host': '172.21.30.150',
     'port': 3306,
     'user': 'root',
-    'password': '123456',  # 请修改密码
-    'db': 'test01',
+    'password': '1qaz@WSX',  # 请修改密码
+    'db': 'kpsnc_upom_mes',
     'autocommit': True,
     'connect_timeout': 10
 }
@@ -41,47 +52,9 @@ QUEUE_MAX_SIZE = 50000  # 内存队列最大长度，防止内存溢出
 LOG_DIR = "logs"  # 日志存放目录
 
 
-# ================= 1. 生产级日志系统设置 =================
-
-# def setup_logging():
-#     """
-#     配置日志系统：同时输出到控制台和文件
-#     使用 RotatingFileHandler 实现日志轮转，防止磁盘写满
-#     """
-#     if not os.path.exists(LOG_DIR):
-#         os.makedirs(LOG_DIR)
-#
-#     # 日志格式: 时间 - 模块名 - 级别 - 内容
-#     log_format = logging.Formatter("%(asctime)s - %(name)s - [%(levelname)s] - %(message)s")
-#
-#     logger = logging.getLogger("IOT_Core")
-#     logger.setLevel(logging.INFO)
-#
-#     # 1. 控制台处理器
-#     stream_handler = logging.StreamHandler(sys.stdout)
-#     stream_handler.setFormatter(log_format)
-#     logger.addHandler(stream_handler)
-#
-#     # 2. 文件处理器 (日志轮转)
-#     # maxBytes=10MB: 单个日志最大10MB
-#     # backupCount=5: 保留最近5个日志文件
-#     file_handler = RotatingFileHandler(
-#         filename=os.path.join(LOG_DIR, "service.log"),
-#         maxBytes=10 * 1024 * 1024,
-#         backupCount=5,
-#         encoding='utf-8'
-#     )
-#     file_handler.setFormatter(log_format)
-#     logger.addHandler(file_handler)
-#
-#     return logger
-#
-#
-# logger = setup_logging()
 # ================= 1. 日志初始化与配置 =================
 
 def setup_iot_logging():
-    LOG_DIR = "logs"
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR)
 
@@ -90,8 +63,11 @@ def setup_iot_logging():
     # A. 控制台
     logger.add(
         sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level="INFO",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> "
+               "| <level>{level: <8}</level> "
+               "| <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> "
+               "| <level>{message}</level>",
+        level="DEBUG",
         enqueue=True,
         colorize=True
     )
@@ -121,13 +97,84 @@ def setup_iot_logging():
 setup_iot_logging()
 
 
+def load_target_nodes_config(config_path: str = "nodes_config.json") -> dict:
+
+    if getattr(sys, 'frozen', False):
+        config_path = os.path.join(os.path.dirname(sys.executable), "nodes_config.json")
+    """从JSON文件加载目标节点配置"""
+    if not os.path.exists(config_path):
+        # 使用 logger.error 替换 logging.error
+        logger.error(f"目标节点配置文件 '{config_path}' 未找到！程序将无法采集任何数据。")
+        return {}
+
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        # 使用 logger.error 替换 logging.error
+        logger.error(f"解析配置文件 '{config_path}' 时出错 (JSON格式错误): {e}")
+        return {}
+    except Exception as e:
+        # 使用 logger.error 替换 logging.error
+        logger.error(f"读取配置文件 '{config_path}' 时发生未知错误: {e}")
+        return {}
+
+
+def log_config_summary(nodes_config: dict):
+    """
+    打印加载的设备和点位配置摘要。
+    """
+    if not nodes_config:
+        logger.warning("没有加载到任何设备配置，将不打印配置摘要。")
+        return
+
+    logger.info("=" * 60)
+    logger.info("         设备与点位配置加载摘要")
+    logger.info("=" * 60)
+
+    for device_name, device_info in nodes_config.items():
+        # 打印设备名称
+        logger.info(f"  设备名称: {device_name}")
+
+        # 打印触发点位
+        trigger_node = device_info.get("trigger")
+        if trigger_node:
+            logger.info(f"    └─ 触发点位: {trigger_node}")
+        else:
+            logger.warning(f"    └─ 警告: 设备 '{device_name}' 未配置触发点位！")
+
+        # 打印关联的采集点位
+        items = device_info.get("items", [])
+        if items:
+            logger.info(f"    └─ 采集点位 ({len(items)}个):")
+            for i, item_node in enumerate(items, 1):
+                logger.info(f"        [{i}] {item_node}")
+        else:
+            logger.warning(f"    └─ 警告: 设备 '{device_name}' 未配置任何采集点位！")
+
+        logger.info("-" * 40)  # 打印分隔线，使输出更清晰
+
+    logger.info("=" * 60)
+    logger.info(f"配置摘要打印完毕，共加载 {len(nodes_config)} 个设备。")
+    logger.info("=" * 60)
+
+
+# --- 在程序启动时加载配置 ---
+TARGET_NODES = load_target_nodes_config()
+TRIGGER_TO_DEVICE = {v["trigger"]: k for k, v in TARGET_NODES.items()}
+
+# --- 在加载配置后打印读取信息 ---
+log_config_summary(TARGET_NODES)
+
+
 # ================= 2. 数据库写入服务 (消费者) =================
 
 class DatabaseService:
-    def __init__(self, queue: asyncio.Queue):
+    def __init__(self, queue: asyncio.Queue, archiver: DailyFileArchiver):
         self.queue = queue
         self.pool = None
         self._running = True
+        self.archiver = archiver  # 保存归档器实例
 
     async def _init_pool(self):
         """建立或重建数据库连接池 (保持不变，很稳)"""
@@ -149,16 +196,44 @@ class DatabaseService:
         if not buffer or not self.pool:
             return False
 
-        sql = "INSERT INTO iot_sensor_data (node_id, value, quality, source_time) VALUES (%s, %s, %s, %s)"
+        # === 新增：打印每条记录的简要信息 ===
+        for i, record in enumerate(buffer):
+            rfid, node_id, value, quality, source_time, trace_id = record
+            logger.debug(
+                f"准备写入 [{i + 1}/{len(buffer)}] | "
+                f"设备: {node_id} | "
+                f"RFID: {rfid} | "
+                f"值: {value} | "
+                f"时间: {source_time} | "
+                f"Trace: {trace_id}"
+            )
+
+        sql = "INSERT INTO iot_sensor_data (rfid, node_id, value, quality, source_time, trace_id) VALUES (%s, %s, %s, %s, %s, %s)"
+        buffer_to_write = buffer.copy()
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.executemany(sql, buffer)
                     logger.info(f"成功存入 {len(buffer)} 条数据")
-                    return True
+
+            # 2. 数据库写入成功后，立即在后台发起一个CSV写入任务 (非阻塞)
+            # 这样文件写入不会影响 flush_data 的返回时间和返回值
+            asyncio.create_task(self._write_to_csv(buffer_to_write))
+            return True
         except Exception as e:
             logger.error(f"数据库写入报错: {e}")
+            # 即使数据库写入失败，也可以选择备份数据到CSV，方便排查问题
+            logger.warning(f"数据库写入失败，尝试将 {len(buffer_to_write)} 条数据备份到CSV...")
+            asyncio.create_task(self._write_to_csv(buffer_to_write))
             return False
+
+    async def _write_to_csv(self, buffer: List[tuple]):
+        """一个专门用于异步写入CSV的辅助方法"""
+        try:
+            self.archiver.write_rows(buffer)
+        except Exception as e:
+            # 记录文件写入的错误，但不影响主流程
+            logger.error(f"后台CSV写入任务发生错误: {e}")
 
     async def run(self):
         """消费者主循环"""
@@ -227,42 +302,121 @@ class SubscriptionHandler:
     注意: 这里的代码运行在 asyncua 的回调线程中，必须非常快，不能阻塞
     """
 
-    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    def __init__(self, queue: asyncio.Queue, client, loop: asyncio.AbstractEventLoop):
         self.queue = queue
         self.loop = loop
+        self.client = client
+        self.last_values = {}  # 记录上次信号状态
 
     def datachange_notification(self, node: Node, val: Any, data):
-        logger.info(f"收到原始信号: {node.nodeid.to_string()} = {val}")
+
+        # === 新增：打印原始 Variant 信息 ===
+        variant = data.monitored_item.Value
+        logger.info(f"原始 Variant: Value={variant.Value!r}, "
+                    f"StatusCode={variant.StatusCode}")
+
+        # === 新增：为本次触发生成唯一ID ===
+        trace_id = str(uuid.uuid4())  # 取前8位足够区分，如 "a1b2c3d4"
+
+        logger.info(f"[{trace_id}] 收到原始信号: {node.nodeid.to_string()} = {val}")
+
         """
         当 PLC 点位数据变化时，自动触发此函数
         """
         try:
+
             node_id = node.nodeid.to_string()
+            prev_val = self.last_values.get(node_id)
+            self.last_values[node_id] = val
 
-            # 获取数据源时间戳 (SourceTimestamp)，这是数据产生的真实时间
-            source_ts = data.monitored_item.Value.SourceTimestamp
-            # 获取质量代码
-            quality = str(data.monitored_item.Value.StatusCode)
+            device_name = TRIGGER_TO_DEVICE.get(node_id)
+            if not device_name:
+                return
 
-            # 如果是 datetime 对象，确保它是 UTC 或者本地时间，这里直接存入
-            # 这里的 val 需要转为字符串，保证兼容性
-            payload = (node_id, str(val), quality, source_ts)
+            triggered = False
 
-            # put_nowait 是非阻塞的
-            # 如果队列满了 (超过 QUEUE_MAX_SIZE)，会抛出 QueueFull 异常
-            # self.queue.put_nowait(payload)
+            logger.info(f"[{trace_id}] 🔔 触发事件 | 设备: {device_name} | 新值: {val!r} | 旧值: {prev_val!r}")
 
-            # 【豆包补丁】：线程安全地将数据投递回 asyncio 事件循环
-            def put_into_queue():
-                try:
-                    self.queue.put_nowait(payload)
-                except asyncio.QueueFull:
-                    logger.warning("警告: 内存队列已满！数据库写入速度跟不上采集速度，正在丢弃数据！")
+            if isinstance(val, bool):
+                # === 布尔模式：上升沿触发 ===
+                if val is True and (prev_val is False or prev_val is None):
+                    triggered = True
 
-            self.loop.call_soon_threadsafe(put_into_queue)
+            elif isinstance(val, str) or val is None:
+                # === 字符串模式：单件码变更触发 ===
+                current_clean = (val or "").strip()  # None → "", 然后 strip
+                prev_clean = prev_val.strip() if isinstance(prev_val, str) else ""
+
+                # === 新增：始终打印原始值和清洗后值（用于排查）===
+                logger.debug(
+                    f"[{trace_id}] 字符串点位变更 | 节点: {node_id} | "
+                    f"原始新值: {val!r} → 清洗后: {current_clean!r} | "
+                    f"原始旧值: {prev_val!r} → 清洗后: {prev_clean!r}"
+                )
+                # 触发条件：当前非空 且 与上次不同
+                if current_clean != "" and current_clean != prev_clean:
+                    triggered = True
+
+            else:
+                # 可选：忽略其他类型，或按需扩展（如 int 状态码）
+                logger.debug(f"忽略非 bool/str 类型信号: {type(val).__name__} = {val!r}")
+                return
+
+            if triggered:
+                logger.info(f"[{trace_id}] 🔔 触发事件 | 设备: {device_name} | " f"新值: {val!r} | 旧值: {prev_val!r}")
+                # 跨线程派发异步任务
+                asyncio.run_coroutine_threadsafe(self.read_associated_data(device_name, val, trace_id), self.loop)
 
         except Exception as e:
             logger.error(f"回调处理异常: {e}")
+
+    async def read_associated_data(self, device_name, rfid, trace_id):
+
+        try:
+            config = TARGET_NODES.get(device_name)
+            if not config: return
+
+            nodes = [self.client.get_node(nid) for nid in config["items"]]
+
+            # 批量读取 + 超时保护
+            values = await asyncio.wait_for(self.client.read_values(nodes), timeout=3.0)
+
+            # 3. 【核心修改】：提取点位名字并构建字典
+            # 比如从 "ns=2;s=DeviceA.Temp" 中提取出 "Temp"
+            data_dict = {}
+            for i, node_id in enumerate(config["items"]):
+                # 技巧：取点位字符串最后一部分作为 Key
+                key = node_id.split('.')[-1]
+                val = values[i]
+                # 转换数值类型：如果是 float 则保留两位小数
+                data_dict[key] = round(val, 2) if isinstance(val, (float, int)) else val
+
+            # 4. 转换成标准的 JSON 字符串
+            try:
+                json_payload = json.dumps(data_dict, ensure_ascii=False)
+            except Exception as e:
+                logger.error(f"[{trace_id}] JSON 序列化失败: {e}, 原始数据: {data_dict}")
+                return
+
+            # 5. 入队 (格式: 设备名, JSON内容, 质量, 时间)
+            payload = (
+                rfid,
+                device_name,
+                json_payload,
+                "Good",
+                datetime.datetime.now(),
+                trace_id
+            )
+
+            try:
+                self.queue.put_nowait(payload)
+                logger.info(f"[{trace_id}] ✅ {device_name} 完工信号：{rfid} 数据已入队: {json_payload}")
+            except asyncio.QueueFull:
+                logger.warning("[{trace_id}] 警告: 内存队列已满！数据库写入速度跟不上采集速度，正在丢弃数据！")
+        except asyncio.TimeoutError:
+            logger.error(f"[{trace_id}] ❌ {device_name} 读取超时")
+        except Exception as e:
+            logger.error(f"[{trace_id}] 读取任务异常: {e}")
 
     def status_change_notification(self, status):
         """
@@ -298,6 +452,7 @@ class OpcUaService:
                 self.client = Client(url=OPC_URL)
                 # 设置连接超时，防止网络死掉时程序永久卡死在 connect()
                 self.client.connect_timeout = 10
+                self.client.session_timeout = 60000  # 显式设为 60 秒
                 # 生产环境安全设置 (如需账号密码请取消注释)
                 # self.client.set_user("admin")
                 # self.client.set_password("123456")
@@ -308,28 +463,16 @@ class OpcUaService:
                     # 1. 注册 Namespace (可选，部分 PLC 需要)
                     # ns = await self.client.get_namespace_index(uri)
 
-                    # 2. 建立订阅
-                    handler = SubscriptionHandler(self.queue, self.loop)
-                    # 500ms 扫描一次变化，如果这里设太快，PLC负载会变高
+                    # 1. 提取所有的 trigger 节点进行订阅
+                    trigger_nodes = [self.client.get_node(v["trigger"]) for v in TARGET_NODES.values()]
+
+                    # 2. 创建订阅
+                    handler = SubscriptionHandler(self.queue, self.client, self.loop)
                     sub = await self.client.create_subscription(500, handler)
 
-                    # 3. 获取点位节点对象
-                    nodes = []
-                    for node_str in TARGET_NODES:
-                        try:
-                            n = self.client.get_node(node_str)
-                            nodes.append(n)
-                        except Exception as e:
-                            logger.error(f"无效的点位 ID: {node_str} - {e}")
-
-                    if not nodes:
-                        logger.error("没有有效的点位，等待重试...")
-                        await asyncio.sleep(5)
-                        continue
-
-                    # 4. 订阅数据变化
-                    await sub.subscribe_data_change(nodes)
-                    logger.info(f"成功订阅 {len(nodes)} 个点位，进入监听模式...")
+                    # 3. 订阅所有触发信号
+                    await sub.subscribe_data_change(trigger_nodes)
+                    logger.info(f"📡 已订阅 {len(trigger_nodes)} 个设备的触发信号")
 
                     # --- 核心心跳监控 ---
                     while self._running:
@@ -339,7 +482,8 @@ class OpcUaService:
 
                             # 使用标准强制节点 i=2259 (Server_ServerStatus_CurrentTime)
                             # 这在 Siemens, Beckhoff, Omron 等所有标准 PLC 上都存在
-                            server_time_node = self.client.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
+                            server_time_node = self.client.get_node(
+                                ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
                             await server_time_node.read_value()
 
                         except Exception as e:
@@ -403,8 +547,12 @@ async def main():
     # 假设一条数据占用 1KB，5万条约占用 50MB 内存，非常安全
     data_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
 
+    # --- 关键修改：在这里创建 DailyFileArchiver 实例 ---
+    csv_headers = ['rfid', 'node_id', 'value', 'quality', 'source_time', 'trace_id']
+    file_archiver = DailyFileArchiver(base_filename="iot_backup", headers=csv_headers)
+
     # 2. 实例化服务
-    db_service = DatabaseService(data_queue)
+    db_service = DatabaseService(data_queue, file_archiver)
     opc_service = OpcUaService(data_queue, loop)
 
     # 3. 注册信号处理 (用于优雅退出)
@@ -425,8 +573,7 @@ async def main():
             # Windows 下可能不支持 add_signal_handler，这只是一个警告
             pass
 
-    # 4. 启动任务
-    # 使用 create_task 将它们放入后台运行
+    # 4. 启动任务，使用 create_task 将它们放入后台运行
     task_monitor = asyncio.create_task(monitor_queue_task(data_queue, QUEUE_MAX_SIZE))
     task_db = asyncio.create_task(db_service.run())
     task_opc = asyncio.create_task(opc_service.run())
