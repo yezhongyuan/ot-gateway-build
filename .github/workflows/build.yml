@@ -26,10 +26,12 @@ jobs:
     - name: 4. 执行 PyInstaller 打包
       # --collect-all asyncua 是解决 OPC UA 报错的关键
       run: |
-        pyinstaller -F --collect-all asyncua -n IOT_Gateway_Windows OpcUa_Service.py
+        pyinstaller -F --collect-all asyncua --add-data "nodes_config.json;." -n IOT_Gateway_Windows OpcUa_Service.py
 
     - name: 5. 将生成的 EXE 存为产物
       uses: actions/upload-artifact@v4
       with:
         name: Gateway_Exe_Build_Result  # 这是下载时的文件夹名
-        path: dist/IOT_Gateway_Windows.exe
+        path: |
+          dist/IOT_Gateway_Windows.exe
+          nodes_config.json
