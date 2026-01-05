@@ -14,10 +14,12 @@ class DailyFileArchiver:
         self.headers = headers
         self.csv_file = None
         self.csv_writer = None
+        self.output_dir = "csv"
 
     def _get_today_filename(self) -> str:
         today = datetime.now().strftime("%Y%m%d")
-        return f"{self.base_filename}_{today}.csv"
+        #return f"{self.base_filename}_{today}.csv"
+        return os.path.join(self.output_dir, f"{self.base_filename}_{today}.csv")
 
     def _ensure_today_file_open(self):
         """
@@ -25,6 +27,7 @@ class DailyFileArchiver:
         核心修改：增加了对文件是否存在的检查，以处理文件被外部删除的情况。
         """
         today_filename = self._get_today_filename()
+        os.makedirs(self.output_dir, exist_ok=True)
 
         # --- 核心修改开始 ---
         # 检查条件：

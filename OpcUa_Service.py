@@ -23,6 +23,7 @@ from file_archiver import DailyFileArchiver
 
 # OPC UA 服务端地址
 OPC_URL = "opc.tcp://172.21.254.50:49320"
+# OPC_URL = "opc.tcp://localhost:4840"
 
 # 数据库连接配置
 # DB_CONFIG = {
@@ -98,7 +99,6 @@ setup_iot_logging()
 
 
 def load_target_nodes_config(config_path: str = "nodes_config.json") -> dict:
-
     if getattr(sys, 'frozen', False):
         config_path = os.path.join(os.path.dirname(sys.executable), "nodes_config.json")
     """从JSON文件加载目标节点配置"""
@@ -310,15 +310,12 @@ class SubscriptionHandler:
 
     def datachange_notification(self, node: Node, val: Any, data):
 
-        # === 新增：打印原始 Variant 信息 ===
-        variant = data.monitored_item.Value
-        logger.info(f"原始 Variant: Value={variant.Value!r}, "
-                    f"StatusCode={variant.StatusCode}")
-
         # === 新增：为本次触发生成唯一ID ===
         trace_id = str(uuid.uuid4())  # 取前8位足够区分，如 "a1b2c3d4"
 
-        logger.info(f"[{trace_id}] 收到原始信号: {node.nodeid.to_string()} = {val}")
+        # === 新增：打印原始 Variant 信息 ===
+        variant = data.monitored_item.Value
+        logger.debug(f"[{trace_id}] 原始信号 Variant: Value={variant.Value!r}, "f"StatusCode={variant.StatusCode}")
 
         """
         当 PLC 点位数据变化时，自动触发此函数
@@ -335,7 +332,7 @@ class SubscriptionHandler:
 
             triggered = False
 
-            logger.info(f"[{trace_id}] 🔔 触发事件 | 设备: {device_name} | 新值: {val!r} | 旧值: {prev_val!r}")
+            logger.info(f"[{trace_id}] 🔔 信号变化 | 设备: {device_name} | 点位: {node.nodeid.to_string()} | 新值: {val!r} | 旧值: {prev_val!r}")
 
             if isinstance(val, bool):
                 # === 布尔模式：上升沿触发 ===
@@ -359,11 +356,11 @@ class SubscriptionHandler:
 
             else:
                 # 可选：忽略其他类型，或按需扩展（如 int 状态码）
-                logger.debug(f"忽略非 bool/str 类型信号: {type(val).__name__} = {val!r}")
+                logger.error(f"忽略非 bool/str 类型信号: {type(val).__name__} = {val!r}")
                 return
 
             if triggered:
-                logger.info(f"[{trace_id}] 🔔 触发事件 | 设备: {device_name} | " f"新值: {val!r} | 旧值: {prev_val!r}")
+                logger.info(f"[{trace_id}] 🔔 触发队列事件 | 设备: {device_name} | 点位: {node.nodeid.to_string()} | " f"新值: {val!r} | 旧值: {prev_val!r}")
                 # 跨线程派发异步任务
                 asyncio.run_coroutine_threadsafe(self.read_associated_data(device_name, val, trace_id), self.loop)
 
