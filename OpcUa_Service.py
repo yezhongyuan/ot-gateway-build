@@ -22,7 +22,7 @@ from file_archiver import DailyFileArchiver
 # ================= 配置区域 (建议生产环境放入 .env 文件) =================
 
 # OPC UA 服务端地址
-OPC_URL = "opc.tcp://172.21.254.50:49320"
+OPC_URL = "opc.tcp://172.21.30.150:49320"
 # OPC_URL = "opc.tcp://localhost:4840"
 
 # 数据库连接配置
@@ -390,7 +390,21 @@ class SubscriptionHandler:
 
             # 4. 转换成标准的 JSON 字符串
             try:
-                json_payload = json.dumps(data_dict, ensure_ascii=False)
+                # 自定义序列化函数，处理datetime和其他特殊类型
+                def json_default(obj):
+                    if isinstance(obj, datetime.datetime):
+                        # 将datetime转换为ISO 8601格式字符串（工业标准）
+                        return obj.isoformat()
+                    elif isinstance(obj, bytes):
+                        # 处理字节类型
+                        return obj.decode('utf-8', errors='replace')
+                    elif obj is None:
+                        # 显式返回None（JSON支持）
+                        return None
+                    else:
+                        # 对于其他未知类型，转换为字符串
+                        return str(obj)
+                json_payload = json.dumps(data_dict, ensure_ascii=False, default=json_default)
             except Exception as e:
                 logger.error(f"[{trace_id}] JSON 序列化失败: {e}, 原始数据: {data_dict}")
                 return
@@ -438,79 +452,88 @@ class OpcUaService:
         self.loop = loop
         self.client = None
         self._running = True
+        self._stop_event = asyncio.Event()  # <--- 加这个
 
-    async def run(self):
+    async def run2(self):
         """客户端主循环 (包含断线重连)"""
         logger.info(f"正在启动 OPC UA 采集服务，目标: {OPC_URL}")
 
         while self._running:
-            self.client = None  # 确保每次循环开始前引用是干净的
+            self.client = None
+            self.sub = None  # <-- 加这个
             try:
                 self.client = Client(url=OPC_URL)
-                # 设置连接超时，防止网络死掉时程序永久卡死在 connect()
                 self.client.connect_timeout = 10
-                self.client.session_timeout = 60000  # 显式设为 60 秒
-                # 生产环境安全设置 (如需账号密码请取消注释)
-                # self.client.set_user("admin")
-                # self.client.set_password("123456")
+                self.client.session_timeout = 60000
 
-                async with self.client:
-                    logger.info("已连接至 OPC UA Server")
+                # 关键：禁用自动关闭，避免冲突
+                self.client.auto_close_session = False
 
-                    # 1. 注册 Namespace (可选，部分 PLC 需要)
-                    # ns = await self.client.get_namespace_index(uri)
+                # 手动连接，不要用 async with
+                await self.client.connect()
+                logger.info("已连接至 OPC UA Server")
 
-                    # 1. 提取所有的 trigger 节点进行订阅
-                    trigger_nodes = [self.client.get_node(v["trigger"]) for v in TARGET_NODES.values()]
+                # 订阅
+                trigger_nodes = [self.client.get_node(v["trigger"]) for v in TARGET_NODES.values()]
+                handler = SubscriptionHandler(self.queue, self.client, self.loop)
+                self.sub = await self.client.create_subscription(500, handler)
+                await self.sub.subscribe_data_change(trigger_nodes)
+                logger.info(f"📡 已订阅 {len(trigger_nodes)} 个设备的触发信号")
 
-                    # 2. 创建订阅
-                    handler = SubscriptionHandler(self.queue, self.client, self.loop)
-                    sub = await self.client.create_subscription(500, handler)
+                # 心跳
+                while self._running:
+                    try:
+                        server_time_node = self.client.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
+                        await server_time_node.read_value()
+                    except Exception as e:
+                        logger.error(f"心跳检测失败，连接断开: {e}")
+                        break
 
-                    # 3. 订阅所有触发信号
-                    await sub.subscribe_data_change(trigger_nodes)
-                    logger.info(f"📡 已订阅 {len(trigger_nodes)} 个设备的触发信号")
-
-                    # --- 核心心跳监控 ---
-                    while self._running:
-                        try:
-                            # 1. 尝试读取服务器当前时间或状态，这是最实时的链路检测
-                            # await self.client.nodes.server_state.read_value()
-
-                            # 使用标准强制节点 i=2259 (Server_ServerStatus_CurrentTime)
-                            # 这在 Siemens, Beckhoff, Omron 等所有标准 PLC 上都存在
-                            server_time_node = self.client.get_node(
-                                ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
-                            await server_time_node.read_value()
-
-                        except Exception as e:
-                            # 如果这里读失败了，说明 TCP 连接已经不可用了
-                            logger.error(f"心跳检测失败，连接可能已断开: {e}")
-                            break  # 跳出内循环，进入 finally 进行清理并重连
-
-                        await asyncio.sleep(5)  # 每 5 秒心跳一次
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
+                    #await asyncio.sleep(5)
 
             except (OSError, asyncio.TimeoutError, ua.UaError) as e:
-                logger.error(f"连接断开或网络错误: {e}")
+                logger.error(f"连接错误: {e}")
             except Exception as e:
-                logger.critical(f"严重未知错误: {e}", exc_info=True)
+                logger.critical(f"严重错误: {e}", exc_info=True)
+
             finally:
+                # ===================== 【核心修复】清理资源 =====================
                 if self.client:
                     try:
-                        logger.info("正在强制断开并清理残留连接资源...")
+                        # 1. 先删订阅（必须！否则内存泄漏）
+                        if self.sub:
+                            await self.sub.delete()
+                            logger.info("✅ 订阅已清理")
+
+                        # 2. 关闭会话（必须！否则会话泄漏）
+                        await self.client.close_session()
+                        logger.info("✅ 会话已关闭")
+
+                        # 3. 最后断开TCP
                         await self.client.disconnect()
-                    except:
-                        logger.info("断网情况下 disconnect 报错是正常的...")
-                        pass  # 断网情况下 disconnect 报错是正常的
+                        logger.info("✅ TCP 已断开")
+
+                    except Exception as e:
+                        logger.info(f"清理时正常报错: {e}")
 
                 if self._running:
-                    logger.warning("5 秒后尝试重新连接...")
+                    logger.warning("5秒后重连...")
                     await asyncio.sleep(5)
 
-        logger.info("OPC UA 服务循环已结束")
+        logger.info("OPC UA 服务已结束")
 
     def stop(self):
+        logger.info("🛑 正在停止 OPC UA 服务...")
         self._running = False
+        # 触发事件，立即唤醒 sleep；_stop_event.set()会保持
+        try:
+            self._stop_event.set()
+        except:
+            pass
 
 
 # ================= 4. 队列监控任务 =================
@@ -573,7 +596,7 @@ async def main():
     # 4. 启动任务，使用 create_task 将它们放入后台运行
     task_monitor = asyncio.create_task(monitor_queue_task(data_queue, QUEUE_MAX_SIZE))
     task_db = asyncio.create_task(db_service.run())
-    task_opc = asyncio.create_task(opc_service.run())
+    task_opc = asyncio.create_task(opc_service.run2())
 
     # 5. 等待停止信号
     # 在 Windows 下如果不支持信号，这里可能需要改成 loop.run_forever() 的变体
